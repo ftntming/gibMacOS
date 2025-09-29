@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 from Scripts import downloader,utils,run,plist
-import os, shutil, time, sys, argparse, re, json
+import os, shutil, time, sys, argparse, re, json, subprocess
 
 class ProgramError(Exception):
     def __init__(self, message, title = "Error"):
-        super().__init__(message)
+        super(Exception, self).__init__(message)
         self.title = title
 
 
@@ -35,11 +35,25 @@ class gibMacOS:
         if os.path.exists(self.settings_path):
             try: self.settings = json.load(open(self.settings_path))
             except: pass
+
+        # Load prod_cache.json if it exists in the Scripts folder
+        self.prod_cache_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),"Scripts","prod_cache.plist")
+        self.prod_cache = {}
+        if os.path.exists(self.prod_cache_path):
+            try:
+                with open(self.prod_cache_path,"rb") as f:
+                    self.prod_cache = plist.load(f)
+                assert isinstance(self.prod_cache,dict)
+            except:
+                self.prod_cache = {}
         
-        self.current_macos = self.settings.get("current_macos",17) # if > 16, assume X-5, else 10.X
+        # If > 16, assume X-5, else 10.X
+        # e.g. 17 = Monterey, 18 = Ventura, 19 = Sonoma, 20 = Sequoia
+        self.current_macos = self.settings.get("current_macos",20)
         self.min_macos = 5
         self.print_urls = self.settings.get("print_urls",False)
         self.print_json = False
+        self.hide_pid = self.settings.get("hide_pid",False)
         self.mac_os_names_url = {
             "8" : "mountainlion",
             "7" : "lion",
@@ -62,12 +76,16 @@ class gibMacOS:
             "big sur" : "11",
             "monterey" : "12",
             "ventura" : "13",
-            "sonoma" : "14"
+            "sonoma" : "14",
+            "sequoia" : "15",
+            "tahoe" : "26"
         }
         self.current_catalog = self.settings.get("current_catalog","publicrelease")
         self.catalog_data    = None
         self.scripts = "Scripts"
-        self.plist   = "sucatalog.plist"
+        self.local_catalog = os.path.join(os.path.dirname(os.path.realpath(__file__)),self.scripts,"sucatalog.plist")
+        self.caffeinate_downloads = self.settings.get("caffeinate_downloads",True)
+        self.caffeinate_process = None
         self.save_local = False
         self.force_local = False
         self.find_recovery = self.settings.get("find_recovery",False)
@@ -79,8 +97,11 @@ class gibMacOS:
             "current_macos",
             "current_catalog",
             "print_urls",
-            "find_recovery"
+            "find_recovery",
+            "hide_pid",
+            "caffeinate_downloads"
         )
+        self.mac_prods = []
 
     def resize(self, width=0, height=0):
         if not self.interactive:
@@ -100,13 +121,28 @@ class gibMacOS:
                     "Failed to save settings to:\n\n{}\n\nWith error:\n\n - {}\n".format(self.settings_path,repr(e)),
                     title="Error Saving Settings")
 
+    def save_prod_cache(self):
+        try:
+            with open(self.prod_cache_path,"wb") as f:
+                plist.dump(self.prod_cache,f)
+        except Exception as e:
+            raise ProgramError(
+                    "Failed to save product cache to:\n\n{}\n\nWith error:\n\n - {}\n".format(self.prod_cache_path,repr(e)),
+                    title="Error Saving Product Cache")
+
     def set_prods(self):
         self.resize()
         if not self.get_catalog_data(self.save_local):
-            message += "The currently selected catalog ({}) was not reachable\n".format(self.current_catalog)
+            message = "The currently selected catalog ({}) was not reachable\n".format(self.current_catalog)
             if self.save_local:
-                message += "and I was unable to locate a valid {} file in the\n{} directory.\n".format(self.plist, self.scripts)
+                message += "and I was unable to locate a valid catalog file at:\n - {}\n".format(
+                    self.local_catalog
+                )
             message += "Please ensure you have a working internet connection."
+            if self.interactive:
+                print(message)
+                self.u.grab("\nPress [enter] to continue...")
+                return
             raise ProgramError(message, title="Catalog Data Error")
         self.u.head("Parsing Data")
         self.u.info("Scanning products after catalog download...\n")
@@ -134,7 +170,9 @@ class gibMacOS:
         if minos is None: minos = self.min_macos
         if maxos is None: maxos = self.current_macos
         if minos > maxos: minos,maxos = maxos,minos # Ensure min is less than or equal
-        os_versions = [self.num_to_macos(x,for_url=True) for x in range(minos,maxos+1)]
+        os_versions = [self.num_to_macos(x,for_url=True) for x in range(minos,min(maxos+1,21))] # until sequoia
+        if maxos > 30: # since tahoe
+            os_versions.extend([self.num_to_macos(x,for_url=True) for x in range(31,maxos+1)])
         if catalog:
             # We have a custom catalog - prepend the first entry + catalog to the list
             custom_cat_entry = os_versions[-1]+catalog
@@ -154,19 +192,19 @@ class gibMacOS:
         url = self.build_url(catalog=self.current_catalog, version=self.current_macos)
         self.u.head("Downloading Catalog")
         if local:
-            self.u.info("Checking locally for {}".format(self.plist))
-            cwd = os.getcwd()
-            os.chdir(os.path.dirname(os.path.realpath(__file__)))
-            if os.path.exists(os.path.join(os.path.dirname(os.path.realpath(__file__)), self.scripts, self.plist)):
+            self.u.info("Checking for:\n - {}".format(
+                self.local_catalog
+            ))
+            if os.path.exists(self.local_catalog):
                 self.u.info(" - Found - loading...")
                 try:
-                    with open(os.path.join(os.getcwd(), self.scripts, self.plist), "rb") as f:
+                    with open(self.local_catalog, "rb") as f:
                         self.catalog_data = plist.load(f)
-                    os.chdir(cwd)
+                        assert isinstance(self.catalog_data,dict)
                     return True
-                except:
-                    self.u.info(" - Error loading - downloading instead...\n")
-                    os.chdir(cwd)
+                except Exception as e:
+                    self.u.info(" - Error loading: {}".format(e))
+                    self.u.info(" - Downloading instead...\n")
             else:
                 self.u.info(" - Not found - downloading instead...\n")
         self.u.info("Currently downloading {} catalog from:\n\n{}\n".format(self.current_catalog, url))
@@ -180,14 +218,13 @@ class gibMacOS:
         try:
             # Assume it's valid data - dump it to a local file
             if local or self.force_local:
-                self.u.info(" - Saving to {}...".format(self.plist))
-                cwd = os.getcwd()
-                os.chdir(os.path.dirname(os.path.realpath(__file__)))
-                with open(os.path.join(os.getcwd(), self.scripts, self.plist), "wb") as f:
+                self.u.info(" - Saving to:\n - {}".format(
+                    self.local_catalog
+                ))
+                with open(self.local_catalog, "wb") as f:
                     plist.dump(self.catalog_data, f)
-                os.chdir(cwd)
-        except:
-            self.u.info(" - Error saving!")
+        except Exception as e:
+            self.u.info(" - Error saving: {}".format(e))
             return False
         return True
 
@@ -211,11 +248,11 @@ class gibMacOS:
     def get_build_version(self, dist_dict):
         build = version = name = "Unknown"
         try:
-            dist_url = dist_dict.get("English","") if dist_dict.get("English",None) else dist_dict.get("en","")
-            dist_file = self.d.get_bytes(dist_url, False).decode("utf-8")
+            dist_url = dist_dict.get("English",dist_dict.get("en",""))
+            dist_file = self.d.get_string(dist_url,False)
+            assert isinstance(dist_file,str)
         except:
             dist_file = ""
-            pass
         build_search = "macOSProductBuildVersion" if "macOSProductBuildVersion" in dist_file else "BUILD"
         vers_search  = "macOSProductVersion" if "macOSProductVersion" in dist_file else "VERSION"
         try:
@@ -233,23 +270,83 @@ class gibMacOS:
         try:
             # XXX: This is parsing a JavaScript array from the script part of the dist file.
             device_ids = re.search(r"var supportedDeviceIDs\s*=\s*\[([^]]+)\];", dist_file)[1]
-            device_ids = set(i.lower() for i in re.findall(r"'([^',]+)'", device_ids))
+            device_ids = list(set(i.lower() for i in re.findall(r"'([^',]+)'", device_ids)))
         except:
-            device_ids = set()
+            device_ids = []
         return (build,version,name,device_ids)
 
     def get_dict_for_prods(self, prods, plist_dict = None):
-        if plist_dict==self.catalog_data==None:
-            plist_dict = {}
-        else:
-            plist_dict = self.catalog_data if plist_dict == None else plist_dict
-
+        plist_dict = plist_dict or self.catalog_data or {}
         prod_list = []
+        # Keys required to consider a cached element valid
+        prod_keys = (
+            "build",
+            "date",
+            "description",
+            "device_ids",
+            "installer",
+            "product",
+            "time",
+            "title",
+            "version",
+        )
+
+        def get_packages_and_size(plist_dict,prod,recovery):
+            # Iterate the available packages and save their urls and sizes
+            packages = []
+            size = -1
+            if recovery:
+                # Only get the recovery packages
+                packages = [x for x in plist_dict.get("Products",{}).get(prod,{}).get("Packages",[]) if x["URL"].endswith(self.recovery_suffixes)]
+            else:
+                # Add them all!
+                packages = plist_dict.get("Products",{}).get(prod,{}).get("Packages",[])
+            # Get size
+            size = self.d.get_size(sum([i["Size"] for i in packages]))
+            return (packages,size)
+
+        def print_prod(prod,prod_list):
+            self.u.info(" -->{}. {} ({}){}".format(
+                str(len(prod_list)+1).rjust(3),
+                prod["title"],
+                prod["build"],
+                " - FULL Install" if self.find_recovery and prod["installer"] else ""
+            ))
+
+        def prod_valid(prod,prod_list,prod_keys):
+            # Check if the prod has all prod keys, and
+            # none are "Unknown"
+            if not isinstance(prod_list,dict) or not prod in prod_list or \
+            not all(x in prod_list[prod] for x in prod_keys):
+                # Wrong type, missing the prod, or prod_list keys
+                return False
+            # Let's make sure none of the keys return Unknown
+            if any(prod_list[prod].get(x,"Unknown")=="Unknown" for x in prod_keys):
+                return False
+            return True
+
+        # Boolean to keep track of cache updates
+        prod_changed = False
         for prod in prods:
+            if prod_valid(prod,self.prod_cache,prod_keys):
+                # Already have it - and it's valid.
+                # Create a shallow copy
+                prodd = {}
+                for key in self.prod_cache[prod]:
+                    prodd[key] = self.prod_cache[prod][key]
+                # Update the packages and size lists
+                prodd["packages"],prodd["size"] = get_packages_and_size(plist_dict,prod,self.find_recovery)
+                # Add to our list and continue on
+                prod_list.append(prodd)
+                # Log the product
+                print_prod(prodd,prod_list)
+                continue
             # Grab the ServerMetadataURL for the passed product key if it exists
             prodd = {"product":prod}
             try:
-                b = self.d.get_bytes(plist_dict.get("Products",{}).get(prod,{}).get("ServerMetadataURL",""), False)
+                url = plist_dict.get("Products",{}).get(prod,{}).get("ServerMetadataURL","")
+                assert url
+                b = self.d.get_bytes(url,False)
                 smd = plist.loads(b)
             except:
                 smd = {}
@@ -263,32 +360,80 @@ class gibMacOS:
                 desc = smd.get("localization",{}).get("English",{}).get("description","").decode("utf-8")
                 desctext = desc.split('"p1">')[1].split("</a>")[0]
             except:
-                desctext = None
+                desctext = ""
             prodd["description"] = desctext
-            # Iterate the available packages and save their urls and sizes
-            if self.find_recovery:
-                # Only get the recovery packages
-                prodd["packages"] = [x for x in plist_dict.get("Products",{}).get(prod,{}).get("Packages",[]) if x["URL"].endswith(self.recovery_suffixes)]
-            else:
-                # Add them all!
-                prodd["packages"] = plist_dict.get("Products",{}).get(prod,{}).get("Packages",[])
+            prodd["packages"],prodd["size"] = get_packages_and_size(plist_dict,prod,self.find_recovery)
             # Get size
             prodd["size"] = self.d.get_size(sum([i["Size"] for i in prodd["packages"]]))
             # Attempt to get the build/version/name/device-ids info from the dist
             prodd["build"],v,n,prodd["device_ids"] = self.get_build_version(plist_dict.get("Products",{}).get(prod,{}).get("Distributions",{}))
             prodd["title"] = smd.get("localization",{}).get("English",{}).get("title",n)
-            self.u.info(" -->{}. {} ({}){}".format(
-                str(len(prod_list)+1).rjust(3),
-                prodd["title"],
-                prodd["build"],
-                " - FULL Install" if self.find_recovery and prodd["installer"] else ""
-            ))
             if v.lower() != "unknown":
                 prodd["version"] = v
             prod_list.append(prodd)
+            # If we were able to resolve the SMD URL - or it didn't exist, save it to the cache
+            if smd or not plist_dict.get("Products",{}).get(prod,{}).get("ServerMetadataURL",""):
+                prod_changed = True
+                # Create a temp prod dict so we can save all but the packages and
+                # size keys - as those are determined based on self.find_recovery
+                temp_prod = {}
+                for key in prodd:
+                    if key in ("packages","size"): continue
+                    if prodd[key] == "Unknown":
+                        # Don't cache Unknown values
+                        temp_prod = None
+                        break
+                    temp_prod[key] = prodd[key]
+                if temp_prod:
+                    # Only update the cache if it changed
+                    self.prod_cache[prod] = temp_prod
+            # Log the product
+            print_prod(prodd,prod_list)
+        # Try saving the cache for later
+        if prod_changed and self.prod_cache:
+            try: self.save_prod_cache()
+            except: pass
         # Sort by newest
         prod_list = sorted(prod_list, key=lambda x:x["time"], reverse=True)
         return prod_list
+
+    def start_caffeinate(self):
+        # Check if we need to caffeinate
+        if sys.platform.lower() == "darwin" \
+        and self.caffeinate_downloads \
+        and os.path.isfile("/usr/bin/caffeinate"):
+            # Terminate any existing caffeinate process
+            self.term_caffeinate_proc()
+            # Create a new caffeinate process
+            self.caffeinate_process = subprocess.Popen(
+                ["/usr/bin/caffeinate"],
+                stderr=getattr(subprocess,"DEVNULL",open(os.devnull,"w")),
+                stdout=getattr(subprocess,"DEVNULL",open(os.devnull,"w")),
+                stdin=getattr(subprocess,"DEVNULL",open(os.devnull,"w"))
+            )
+        return self.caffeinate_process
+
+    def term_caffeinate_proc(self):
+        if self.caffeinate_process is None:
+            return True
+        try:
+            if self.caffeinate_process.poll() is None:
+                # Save the time we started waiting
+                start = time.time()
+                while self.caffeinate_process.poll() is None:
+                    # Make sure we haven't waited too long
+                    if time.time() - start > 10:
+                        print(" - Timed out trying to terminate caffeinate process with PID {}!".format(
+                            self.caffeinate_process.pid
+                        ))
+                        return False
+                    # It's alive - terminate it
+                    self.caffeinate_process.terminate()
+                    # Sleep to let things settle
+                    time.sleep(0.02)
+        except:
+            pass
+        return True # Couldn't poll - or we termed it
 
     def download_prod(self, prod, dmg = False):
         # Takes a dictonary of details and downloads it
@@ -302,18 +447,24 @@ class gibMacOS:
             if dmg and not x.get("URL","").lower().endswith(".dmg"):
                 continue
             # add it to the list
-            dl_list.append(x["URL"])
+            dl_list.append(x)
         if not len(dl_list):
             raise ProgramError("There were no files to download")
-        c = 0
         done = []
         if self.print_json:
             print(self.product_to_json(prod))
+            if self.interactive:
+                print("")
+                self.u.grab("Press [enter] to return...")
             return
         elif self.print_urls:
             self.u.head("Download Links")
             print("{}:\n".format(name))
-            print("\n".join([" - {} \n   --> {}".format(os.path.basename(x), x) for x in dl_list]))
+            print("\n".join([" - {} ({}) \n   --> {}".format(
+                os.path.basename(x["URL"]),
+                self.d.get_size(x["Size"],strip_zeroes=True) if x.get("Size") is not None else "?? MB",
+                x["URL"]
+            ) for x in dl_list]))
             if self.interactive:
                 print("")
                 self.u.grab("Press [enter] to return...")
@@ -322,37 +473,59 @@ class gibMacOS:
         if self.download_dir is None and os.path.exists(download_dir):
             while True:
                 self.u.head("Already Exists")
-                self.u.info("It looks like you've already downloaded {}\n".format(name))
+                self.u.info("It looks like you've already downloaded the following package:\n{}\n".format(name))
                 if not self.interactive:
-                    return
-                menu = self.u.grab("Redownload? (y/n):  ")
+                    menu = "r"
+                else:
+                    print("R. Resume Incomplete Files")
+                    print("D. Redownload All Files")
+                    print("")
+                    print("M. Return")
+                    print("Q. Quit")
+                    print("")
+                    menu = self.u.grab("Please select an option:  ")
                 if not len(menu):
                     continue
-                if menu[0].lower() == "n":
+                elif menu.lower() == "q":
+                    self.u.custom_quit()
+                elif menu.lower() == "m":
                     return
-                if menu[0].lower() == "y":
+                elif menu.lower() == "r":
                     break
-            # Remove the old copy, then re-download
-            shutil.rmtree(download_dir)
-        # Make it new
-        os.makedirs(download_dir)
-        for x in dl_list:
-            c += 1
+                elif menu.lower() == "d":
+                    # Remove the old copy, then re-download
+                    shutil.rmtree(download_dir)
+                    break
+        # Make it anew as needed
+        if not os.path.isdir(download_dir):
+            os.makedirs(download_dir)
+        # Clean up any leftover or missed caffeinate
+        # procs
+        self.term_caffeinate_proc()
+        for c,x in enumerate(dl_list,start=1):
+            url = x["URL"]
             self.u.head("Downloading File {} of {}".format(c, len(dl_list)))
+            self.u.info("- {} -\n".format(name))
             if len(done):
                 self.u.info("\n".join(["{} --> {}".format(y["name"], "Succeeded" if y["status"] else "Failed") for y in done]))
                 self.u.info("")
             if dmg:
                 self.u.info("NOTE: Only Downloading DMG Files\n")
-            self.u.info("Downloading {} for {}...\n".format(os.path.basename(x), name))
+            self.u.info("Downloading {}...\n".format(os.path.basename(url)))
             try:
-                self.d.stream_to_file(x, os.path.join(download_dir, os.path.basename(x)))
-                done.append({"name":os.path.basename(x), "status":True})
+                # Caffeinate as needed
+                self.start_caffeinate()
+                result = self.d.stream_to_file(url, os.path.join(download_dir, os.path.basename(url)), allow_resume=True)
+                assert result is not None
+                done.append({"name":os.path.basename(url), "status":True})
             except:
-                done.append({"name":os.path.basename(x), "status":False})
+                done.append({"name":os.path.basename(url), "status":False})
+            # Kill caffeinate if we need to
+            self.term_caffeinate_proc()
         succeeded = [x for x in done if x["status"]]
         failed    = [x for x in done if not x["status"]]
         self.u.head("Downloaded {} of {}".format(len(succeeded), len(dl_list)))
+        self.u.info("- {} -\n".format(name))
         self.u.info("Succeeded:")
         if len(succeeded):
             for x in succeeded:
@@ -372,12 +545,13 @@ class gibMacOS:
             raise ProgramError("{} files failed to download".format(len(failed)))
 
     def product_to_json(self, prod):
-        return json.dumps({
-            **{key: value for key, value in prod.items()
-               if key in ["product", "version", "build", "title", "size", "packages"]},
-            "date": prod["date"].isoformat(),
-            "deviceIds": list(prod["device_ids"]),
-        })
+        prod_dict = {}
+        for key in ["product", "version", "build", "title", "size", "packages"]:
+            if key in prod:
+                prod_dict[key] = prod[key]
+        prod_dict["date"] = prod["date"].isoformat()
+        prod_dict["deviceIds"] = list(prod["device_ids"])
+        return json.dumps(prod_dict,indent=2)
 
     def show_catalog_url(self):
         self.resize()
@@ -444,8 +618,13 @@ class gibMacOS:
         if not version: return
         self.current_macos = version
         self.save_settings()
-        # At this point, we should be good
-        self.get_catalog_data()
+        # At this point, we should be good - set teh catalog
+        # data - but if it fails, remove the listed prods
+        if not self.get_catalog_data():
+            self.catalog_data = None
+            self.u.grab("\nPress [enter] to return...")
+            self.pick_macos()
+            return
 
     def main(self, dmg = False):
         lines = []
@@ -455,22 +634,30 @@ class gibMacOS:
             lines.append("No installers in catalog!")
             lines.append(" ")
         for num,p in enumerate(self.mac_prods,start=1):
-            var1 = "{}. {} {}".format(num, p["title"], p["version"])
+            var1 = "{}. {} {}".format(str(num).rjust(2), p["title"], p["version"])
+            var2 = ""
             if p["build"].lower() != "unknown":
                 var1 += " ({})".format(p["build"])
-            var2 = "   - {} - Added {} - {}".format(p["product"], p["date"], p["size"])
+            if not self.hide_pid:
+                var2 = "   - {} - Added {} - {}".format(p["product"], p["date"], p["size"])
             if self.find_recovery and p["installer"]:
                 # Show that it's a full installer
-                var2 += " - FULL Install"
+                if self.hide_pid:
+                    var1 += " - FULL Install"
+                else:
+                    var2 += " - FULL Install"
             lines.append(var1)
-            lines.append(var2)
+            if not self.hide_pid:
+                lines.append(var2)
         lines.append(" ")
         lines.append("M. Change Max-OS Version (Currently {})".format(self.num_to_macos(self.current_macos,for_url=False)))
         lines.append("C. Change Catalog (Currently {})".format(self.current_catalog))
         lines.append("I. Only Print URLs (Currently {})".format("On" if self.print_urls else "Off"))
+        lines.append("H. {} Package IDs and Upload Dates".format("Show" if self.hide_pid else "Hide"))
         if sys.platform.lower() == "darwin":
             lines.append("S. Set Current Catalog to SoftwareUpdate Catalog")
             lines.append("L. Clear SoftwareUpdate Catalog")
+            lines.append("F. Caffeinate Downloads to Prevent Sleep (Currently {})".format("On" if self.caffeinate_downloads else "Off"))
         lines.append("R. Toggle Recovery-Only (Currently {})".format("On" if self.find_recovery else "Off"))
         lines.append("U. Show Catalog URL")
         lines.append("Q. Quit")
@@ -486,7 +673,6 @@ class gibMacOS:
             self.u.custom_quit()
         elif menu[0].lower() == "u":
             self.show_catalog_url()
-            return
         elif menu[0].lower() == "m":
             self.pick_macos()
         elif menu[0].lower() == "c":
@@ -494,15 +680,9 @@ class gibMacOS:
         elif menu[0].lower() == "i":
             self.print_urls ^= True
             self.save_settings()
-            return
-        elif menu[0].lower() == "l" and sys.platform.lower() == "darwin":
-            # Clear the software update catalog
-            self.u.head("Clearing SU CatalogURL")
-            print("sudo softwareupdate --clear-catalog")
-            self.r.run({"args":["softwareupdate","--clear-catalog"],"sudo":True})
-            print("")
-            self.u.grab("Done.", timeout=5)
-            return
+        elif menu[0].lower() == "h":
+            self.hide_pid ^= True
+            self.save_settings()
         elif menu[0].lower() == "s" and sys.platform.lower() == "darwin":
             # Set the software update catalog to our current catalog url
             self.u.head("Setting SU CatalogURL")
@@ -513,7 +693,17 @@ class gibMacOS:
             self.r.run({"args":["softwareupdate","--set-catalog",url],"sudo":True})
             print("")
             self.u.grab("Done",timeout=5)
-            return
+        elif menu[0].lower() == "l" and sys.platform.lower() == "darwin":
+            # Clear the software update catalog
+            self.u.head("Clearing SU CatalogURL")
+            print("sudo softwareupdate --clear-catalog")
+            self.r.run({"args":["softwareupdate","--clear-catalog"],"sudo":True})
+            print("")
+            self.u.grab("Done.", timeout=5)
+        elif menu[0].lower() == "f" and sys.platform.lower() == "darwin":
+            # Toggle our caffeinate downloads value and save settings
+            self.caffeinate_downloads ^= True
+            self.save_settings()
         elif menu[0].lower() == "r":
             self.find_recovery ^= True
             self.save_settings()
@@ -522,16 +712,15 @@ class gibMacOS:
             self.u.head("Parsing Data")
             print("Re-scanning products after url preference toggled...\n")
             self.mac_prods = self.get_dict_for_prods(self.get_installers())
-            return
-        
-        # Assume we picked something
-        try:
-            menu = int(menu)
-        except:
-            return
-        if menu < 1 or menu > len(self.mac_prods):
-            return
-        self.download_prod(self.mac_prods[menu-1], dmg)
+        else:
+            # Assume we picked something
+            try:
+                menu = int(menu)
+            except:
+                return
+            if menu < 1 or menu > len(self.mac_prods):
+                return
+            self.download_prod(self.mac_prods[menu-1], dmg)
 
     def get_latest(self, device_id = None, dmg = False):
         self.u.head("Downloading Latest")
@@ -597,7 +786,8 @@ if __name__ == '__main__':
     parser.add_argument("-r", "--recovery", help="looks for RecoveryHDUpdate.pkg and RecoveryHDMetaDmg.pkg in lieu of com.apple.mpkg.OSInstall (overrides --dmg)", action="store_true")
     parser.add_argument("-d", "--dmg", help="downloads only the .dmg files", action="store_true")
     parser.add_argument("-s", "--savelocal", help="uses a locally saved sucatalog.plist if exists", action="store_true")
-    parser.add_argument("-n", "--newlocal", help="downloads and saves locally, overwriting any prior local sucatalog.plist", action="store_true")
+    parser.add_argument("-g", "--local-catalog", help="the path to the sucatalog.plist to use (implies --savelocal)")
+    parser.add_argument("-n", "--newlocal", help="downloads and saves locally, overwriting any prior sucatalog.plist (will use the path from --local-catalog if provided)", action="store_true")
     parser.add_argument("-c", "--catalog", help="sets the CATALOG to use - publicrelease, public, customer, developer")
     parser.add_argument("-p", "--product", help="sets the product id to search for (overrides --version)")
     parser.add_argument("-v", "--version", help="sets the version of macOS to target - eg '-v 10.14' or '-v Yosemite'")
@@ -606,17 +796,27 @@ if __name__ == '__main__':
     parser.add_argument("-D", "--device-id", help="use with --version or --latest to search for versions supporting the specified Device ID - eg VMM-x86_64 for any x86_64")
     parser.add_argument("-i", "--print-urls", help="only prints the download URLs, does not actually download them", action="store_true")
     parser.add_argument("-j", "--print-json", help="only prints the product metadata in JSON, does not actually download it", action="store_true")
-    parser.add_argument("--no-interactive", help="run in non-interactive mode", action="store_true")
+    parser.add_argument("--no-interactive", help="run in non-interactive mode (auto-enabled when using --product or --version)", action="store_true")
     parser.add_argument("-o", "--download-dir", help="overrides directory where the downloaded files are saved")
     args = parser.parse_args()
 
-    g = gibMacOS(interactive=not args.no_interactive, download_dir=args.download_dir)
+    if args.build and not (args.latest or args.product or args.version):
+        print("The --build option requires a --version")
+        exit(1)
+
+    interactive = not any((args.no_interactive,args.product,args.version))
+    g = gibMacOS(interactive=interactive, download_dir=args.download_dir)
+
     if args.recovery:
         args.dmg = False
         g.find_recovery = args.recovery
 
     if args.savelocal:
         g.save_local = True
+
+    if args.local_catalog:
+        g.save_local = True
+        g.local_catalog = args.local_catalog
 
     if args.newlocal:
         g.force_local = True
